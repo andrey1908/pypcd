@@ -37,6 +37,8 @@ __all__ = ['PointCloud',
            'save_txt',
            'cat_point_clouds',
            'add_fields',
+           'remove_fields',
+           'remove_invalid_points',
            'update_field',
            'build_ascii_fmtstr',
            'encode_rgb_for_pcl',
@@ -278,7 +280,7 @@ def point_cloud_from_fileobj(f):
     header = []
     while True:
         ln = f.readline().strip()
-        header.append(str(ln, 'utf-8'))
+        header.append(str(ln, 'ascii'))
         if ln.startswith(b'DATA'):
             metadata = parse_header(header)
             dtype = _build_dtype(metadata)
@@ -321,10 +323,10 @@ def point_cloud_to_fileobj(pc, fileobj, data_compression=None):
         metadata['data'] = data_compression
 
     header = write_header(metadata)
-    fileobj.write(header)
+    fileobj.write(bytes(header, 'ascii'))
     if metadata['data'].lower() == 'ascii':
         fmtstr = build_ascii_fmtstr(pc)
-        np.savetxt(fileobj, pc.pc_data, fmt=fmtstr)
+        np.savetxt(fileobj, pc.pc_data.view(np.float32).reshape((-1, len(pc.fields))), fmt=fmtstr)
     elif metadata['data'].lower() == 'binary':
         fileobj.write(pc.pc_data.tostring('C'))
     elif metadata['data'].lower() == 'binary_compressed':
@@ -357,7 +359,7 @@ def point_cloud_to_fileobj(pc, fileobj, data_compression=None):
 
 
 def point_cloud_to_path(pc, fname):
-    with open(fname, 'w') as f:
+    with open(fname, 'wb') as f:
         point_cloud_to_fileobj(pc, f)
 
 
@@ -370,21 +372,21 @@ def point_cloud_to_buffer(pc, data_compression=None):
 def save_point_cloud(pc, fname):
     """ Save pointcloud to fname in ascii format.
     """
-    with open(fname, 'w') as f:
+    with open(fname, 'wb') as f:
         point_cloud_to_fileobj(pc, f, 'ascii')
 
 
 def save_point_cloud_bin(pc, fname):
     """ Save pointcloud to fname in binary format.
     """
-    with open(fname, 'w') as f:
+    with open(fname, 'wb') as f:
         point_cloud_to_fileobj(pc, f, 'binary')
 
 
 def save_point_cloud_bin_compressed(pc, fname):
     """ Save pointcloud to fname in binary compressed format.
     """
-    with open(fname, 'w') as f:
+    with open(fname, 'wb') as f:
         point_cloud_to_fileobj(pc, f, 'binary_compressed')
 
 
@@ -481,7 +483,7 @@ def add_fields(pc, metadata, pc_data):
         else:
             fieldnames.extend(['%s_%04d' % (f, i) for i in xrange(c)])
             typenames.extend([np_type]*c)
-    dtype = zip(fieldnames, typenames)
+    dtype = list(zip(fieldnames, typenames))
     # new dtype. could be inferred?
     new_dtype = [(f, pc.pc_data.dtype[f])
                  for f in pc.pc_data.dtype.names] + dtype
@@ -494,6 +496,63 @@ def add_fields(pc, metadata, pc_data):
 
     # TODO maybe just all the metadata in the dtype.
     # TODO maybe use composite structured arrays for fields with count > 1
+    newpc = PointCloud(new_metadata, new_data)
+    return newpc
+    
+    
+def remove_fields(pc, fields_to_remove):
+    # Builds copy of pointcloud without some fields.
+    
+    for field_to_rm in fields_to_remove:
+        if field_to_rm not in pc.fields:
+            raise Exception("Field " + field_to_rm + " does not exist.")
+    
+    new_metadata = pc.get_metadata()
+    for field_to_rm in fields_to_remove:
+        idx = new_metadata['fields'].index(field_to_rm)
+        del new_metadata['fields'][idx]
+        del new_metadata['count'][idx]
+        del new_metadata['size'][idx]
+        del new_metadata['type'][idx]
+
+    fieldnames, typenames = [], []
+    for f, c, t, s in zip(new_metadata['fields'],
+                          new_metadata['count'],
+                          new_metadata['type'],
+                          new_metadata['size']):
+        np_type = pcd_type_to_numpy_type[(t, s)]
+        if c == 1:
+            fieldnames.append(f)
+            typenames.append(np_type)
+        else:
+            fieldnames.extend(['%s_%04d' % (f, i) for i in xrange(c)])
+            typenames.extend([np_type]*c)
+    new_dtype = list(zip(fieldnames, typenames))
+
+    new_data = np.empty(len(pc.pc_data), new_dtype)
+    for n in fieldnames:
+        new_data[n] = pc.pc_data[n]
+
+    newpc = PointCloud(new_metadata, new_data)
+    return newpc
+    
+
+def remove_invalid_points(pc):
+    # Builds copy of pointcloud without invalid points.
+    
+    new_data = pc.pc_data.view(np.float32).reshape((-1, len(pc.fields)))
+    mask_all = np.isfinite(new_data)
+    mask = mask_all[:,0]
+    for i in range(1, len(pc.fields)):
+        mask = mask & mask_all[:,i]
+    new_data = new_data[mask]
+    new_num = new_data.shape[0]
+    new_data = new_data.view(pc.pc_data.dtype)
+    
+    new_metadata = pc.get_metadata()
+    new_metadata['width'] = new_num
+    new_metadata['points'] = new_num
+
     newpc = PointCloud(new_metadata, new_data)
     return newpc
 
@@ -693,7 +752,7 @@ class PointCloud(object):
             warnings.warn('data_compression keyword is deprecated for'
                           ' compression')
             compression = kwargs['data_compression']
-        with open(fname, 'w') as f:
+        with open(fname, 'wb') as f:
             point_cloud_to_fileobj(self, f, compression)
 
     def save_pcd_to_fileobj(self, fileobj, compression=None, **kwargs):
